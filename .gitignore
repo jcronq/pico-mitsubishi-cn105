@@ -11,3 +11,10 @@ __pycache__/
 
 # Secrets - commit only the .example template
 include/secrets.h
+server/.env
+
+# Python
+server/.venv/
+server/build/
+server/dist/
+server/*.egg-info/

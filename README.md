@@ -75,6 +75,17 @@ USB CDC runs at 115200 baud. Boot messages, WiFi link state, MQTT connect
 events, and command parse errors print here. Attach `pio device monitor` to
 watch.
 
+## MCP server
+
+A Python MCP server that wraps the MQTT interface lives at [`server/`](server/).
+It exposes tools like `get_status`, `set_power`, `set_mode`, `set_temperature`,
+and `set_fan_speed` for any MCP client (Alice, Claude Desktop, custom
+integrations). The server does not talk to the Pico directly — it rides the
+same MQTT topics the firmware publishes, so you can keep the firmware
+dedicated to the serial/MQTT loop and layer agent integration on top. See
+[`server/README.md`](server/README.md) for install, config, and the full tool
+reference.
+
 ## Credits
 
 - [SwiCago/HeatPump](https://github.com/SwiCago/HeatPump) — Arduino library implementing the Mitsubishi CN105 protocol.
