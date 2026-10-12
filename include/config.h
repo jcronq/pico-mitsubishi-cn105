@@ -4,7 +4,7 @@
 #define DEVICE_ID        "barn_minisplit"
 #define FRIENDLY_NAME    "Barn Mini-Split"
 #define MANUFACTURER     "Mitsubishi"
-#define MODEL            "unknown"       // fill in from your unit's model sticker
+#define MODEL            "MSZ-FH15NA"    // Mitsubishi FH-series 15kBTU wall-mount, confirmed 2026-10-12
 
 // MQTT topic structure.
 // State and command topics follow the Home Assistant MQTT climate pattern so
