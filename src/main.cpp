@@ -8,11 +8,11 @@
 //   mDNS advertises "barn-minisplit.local" so clients don't need a static IP.
 //
 // Wiring (Pico W -> CN105 via BSS138 or similar bidirectional level shifter):
-//   Pico GP4  (UART1 TX, 3V3)  --[level shifter]--  CN105 pin 4 (RX to unit, 5V)
-//   Pico GP5  (UART1 RX, 3V3)  --[level shifter]--  CN105 pin 3 (TX from unit, 5V)
-//   Pico GND                                        CN105 pin 5 (GND)
-//   Pico VSYS                                       CN105 pin 2 (+5V)
-//   CN105 pin 1 (+12V) left disconnected.
+//   CN105 pin 1 (+12V)           : leave disconnected
+//   CN105 pin 2 (GND)            : Pico GND + shifter GND (common ground)
+//   CN105 pin 3 (+5V)            : Pico VSYS + shifter HV rail
+//   CN105 pin 4 (unit TX, 5V)    : --[shifter HV2/LV2]-- Pico GP5 (UART1 RX)
+//   CN105 pin 5 (unit RX, 5V)    : --[shifter HV1/LV1]-- Pico GP4 (UART1 TX)
 
 #include <Arduino.h>
 #include <WiFi.h>

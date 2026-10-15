@@ -14,15 +14,15 @@ vane, room-temp readback) over a local HTTP API. No cloud.
 
 ### Wiring
 
-CN105 pin numbering with the connector latch down, pins facing you, left to right:
+CN105 pin numbering follows the Mitsubishi convention (nicegear blog + SwiCago community + echavet/MitsubishiCN105ESPHome agree):
 
 | CN105 pin | Signal     | Pico W pin                            |
 |-----------|------------|---------------------------------------|
 | 1         | +12V       | leave disconnected                    |
-| 2         | +5V        | Pico `VSYS` (powers the regulator)    |
-| 3         | TX from unit (5V TTL) | Pico `GP5` through level shifter |
-| 4         | RX to unit (5V TTL)   | Pico `GP4` through level shifter |
-| 5         | GND        | Pico `GND`                            |
+| 2         | GND        | Pico `GND` + shifter `GND`            |
+| 3         | +5V        | Pico `VSYS` + shifter `HV` rail       |
+| 4         | TX from unit (5V TTL) | Pico `GP5` through shifter HV2/LV2 |
+| 5         | RX to unit (5V TTL)   | Pico `GP4` through shifter HV1/LV1 |
 
 The level shifter is mandatory — CN105 is 5V TTL and Pico GPIO is 3.3V-tolerant only.
 
