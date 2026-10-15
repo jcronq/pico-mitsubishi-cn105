@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mitsubishi-mcp"
-version = "0.1.0"
-description = "MCP server wrapping the MQTT interface of a Pico-W-flashed Mitsubishi mini-split"
+version = "0.2.0"
+description = "MCP server wrapping the HTTP interface of a Pico-W-flashed Mitsubishi mini-split"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.0.0",
-  "paho-mqtt>=2.1.0",
+  "requests>=2.31.0",
 ]
 
 [project.scripts]

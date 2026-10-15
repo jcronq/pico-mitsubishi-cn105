@@ -6,16 +6,11 @@
 #define MANUFACTURER     "Mitsubishi"
 #define MODEL            "MSZ-FH15NA"    // Mitsubishi FH-series 15kBTU wall-mount, confirmed 2026-10-12
 
-// MQTT topic structure.
-// State and command topics follow the Home Assistant MQTT climate pattern so
-// discovery payloads below can advertise the right endpoints.
-#define TOPIC_BASE       "cozyhem/climate/" DEVICE_ID
-#define TOPIC_STATE      TOPIC_BASE "/state"
-#define TOPIC_CMD        TOPIC_BASE "/cmd"
-#define TOPIC_AVAIL      TOPIC_BASE "/available"
-
-// Home Assistant MQTT discovery prefix. CozyHem's auto-discovery listens here.
-#define HA_DISCOVERY_PREFIX "homeassistant"
+// HTTP server port and mDNS hostname. CozyHem polls GET /status and POSTs to
+// /command; the mDNS record lets the MCP server and CozyHem adapter address
+// the Pico as "barn-minisplit.local" without a static-IP reservation.
+#define HTTP_PORT        80
+#define MDNS_HOSTNAME    "barn-minisplit"
 
 // UART1 pins on the Pico W for CN105. Change if you wire differently.
 #define CN105_TX_PIN     4

@@ -6,24 +6,17 @@ import json
 import logging
 import os
 from dataclasses import asdict
-from typing import Literal
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
-from .mqtt_client import HeatPumpMqtt, MqttConfig
+from .http_client import HeatPumpHttp, HttpConfig
 
 log = logging.getLogger(__name__)
 
-Mode = Literal["HEAT", "COOL", "FAN", "DRY", "AUTO"]
-Power = Literal["ON", "OFF"]
-Fan = Literal["AUTO", "QUIET", "1", "2", "3", "4"]
-Vane = Literal["AUTO", "1", "2", "3", "4", "5", "SWING"]
-WideVane = Literal["<<", "<", "|", ">", ">>", "<>", "SWING"]
 
-
-def build_server(mqtt_client: HeatPumpMqtt) -> Server:
+def build_server(client: HeatPumpHttp) -> Server:
     srv = Server("mitsubishi-mcp")
 
     @srv.list_tools()
@@ -31,7 +24,12 @@ def build_server(mqtt_client: HeatPumpMqtt) -> Server:
         return [
             Tool(
                 name="get_status",
-                description="Current state of the mini-split: power, mode, setpoint, fan, vane, room temperature, operating flag.",
+                description="Current state of the mini-split: power, mode, setpoint, fan, vane, room temperature, operating flag, connected flag.",
+                inputSchema={"type": "object", "properties": {}, "required": []},
+            ),
+            Tool(
+                name="get_info",
+                description="Device identity: device_id, friendly name, manufacturer, model, mDNS name, IP, connected flag.",
                 inputSchema={"type": "object", "properties": {}, "required": []},
             ),
             Tool(
@@ -93,46 +91,46 @@ def build_server(mqtt_client: HeatPumpMqtt) -> Server:
     @srv.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "get_status":
-            snap = mqtt_client.snapshot()
+            snap = client.snapshot()
             return [TextContent(type="text", text=json.dumps(asdict(snap), indent=2))]
 
+        if name == "get_info":
+            info = client.info()
+            return [TextContent(type="text", text=json.dumps(info, indent=2))]
+
         if name == "set_power":
-            mqtt_client.command(power=arguments["power"])
-            return [TextContent(type="text", text=f"power -> {arguments['power']}")]
+            result = client.command(power=arguments["power"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         if name == "set_mode":
-            mqtt_client.command(mode=arguments["mode"])
-            return [TextContent(type="text", text=f"mode -> {arguments['mode']}")]
+            result = client.command(mode=arguments["mode"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         if name == "set_temperature":
-            mqtt_client.command(temperature=float(arguments["celsius"]))
-            return [TextContent(type="text", text=f"temperature -> {arguments['celsius']}C")]
+            result = client.command(temperature=float(arguments["celsius"]))
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         if name == "set_fan_speed":
-            mqtt_client.command(fan=arguments["fan"])
-            return [TextContent(type="text", text=f"fan -> {arguments['fan']}")]
+            result = client.command(fan=arguments["fan"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         if name == "set_vane":
-            mqtt_client.command(vane=arguments["vane"])
-            return [TextContent(type="text", text=f"vane -> {arguments['vane']}")]
+            result = client.command(vane=arguments["vane"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         if name == "set_wide_vane":
-            mqtt_client.command(widevane=arguments["widevane"])
-            return [TextContent(type="text", text=f"widevane -> {arguments['widevane']}")]
+            result = client.command(widevane=arguments["widevane"])
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         raise ValueError(f"unknown tool: {name}")
 
     return srv
 
 
-def config_from_env() -> MqttConfig:
-    return MqttConfig(
-        host=os.environ["MITSUBISHI_MQTT_HOST"],
-        port=int(os.environ.get("MITSUBISHI_MQTT_PORT", "1883")),
-        username=os.environ.get("MITSUBISHI_MQTT_USERNAME", ""),
-        password=os.environ.get("MITSUBISHI_MQTT_PASSWORD", ""),
-        topic_base=os.environ.get("MITSUBISHI_MQTT_TOPIC_BASE", "cozyhem/climate/barn_minisplit"),
-        client_id=os.environ.get("MITSUBISHI_MQTT_CLIENT_ID", "mitsubishi-mcp"),
+def config_from_env() -> HttpConfig:
+    return HttpConfig(
+        base_url=os.environ.get("MITSUBISHI_URL", "http://barn-minisplit.local"),
+        timeout=float(os.environ.get("MITSUBISHI_TIMEOUT", "5.0")),
     )
 
 
@@ -141,13 +139,8 @@ async def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    mqtt_client = HeatPumpMqtt(config_from_env())
-    mqtt_client.start()
-    mqtt_client.wait_ready(timeout=5.0)   # best-effort warm-up
+    client = HeatPumpHttp(config_from_env())
 
-    srv = build_server(mqtt_client)
-    try:
-        async with stdio_server() as (read, write):
-            await srv.run(read, write, srv.create_initialization_options())
-    finally:
-        mqtt_client.stop()
+    srv = build_server(client)
+    async with stdio_server() as (read, write):
+        await srv.run(read, write, srv.create_initialization_options())

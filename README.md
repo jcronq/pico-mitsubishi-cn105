@@ -2,7 +2,7 @@
 
 Raspberry Pi Pico W firmware for controlling a Mitsubishi mini-split via its
 built-in CN105 serial port. Full bidirectional control (mode, setpoint, fan,
-vane, room-temp readback) over local MQTT. No cloud.
+vane, room-temp readback) over a local HTTP API. No cloud.
 
 ## Hardware
 
@@ -20,8 +20,8 @@ CN105 pin numbering with the connector latch down, pins facing you, left to righ
 |-----------|------------|---------------------------------------|
 | 1         | +12V       | leave disconnected                    |
 | 2         | +5V        | Pico `VSYS` (powers the regulator)    |
-| 3         | RX (to unit, 5V TTL)   | Pico `GP4` through level shifter |
-| 4         | TX (from unit, 5V TTL) | Pico `GP5` through level shifter |
+| 3         | TX from unit (5V TTL) | Pico `GP5` through level shifter |
+| 4         | RX to unit (5V TTL)   | Pico `GP4` through level shifter |
 | 5         | GND        | Pico `GND`                            |
 
 The level shifter is mandatory — CN105 is 5V TTL and Pico GPIO is 3.3V-tolerant only.
@@ -31,66 +31,71 @@ The level shifter is mandatory — CN105 is 5V TTL and Pico GPIO is 3.3V-toleran
 PlatformIO is used; install the extension in VS Code or the CLI (`pip install platformio`).
 
 1. Clone this repo.
-2. `cp include/secrets.h.example include/secrets.h` and fill in WiFi + MQTT.
-3. (Optional) Edit `include/config.h` — device id, friendly name, UART pin assignments, model string.
+2. `cp include/secrets.h.example include/secrets.h` and fill in your WiFi SSID + password.
+3. (Optional) Edit `include/config.h` — device id, friendly name, UART pin assignments, model string, mDNS hostname.
 4. Hold the BOOTSEL button on the Pico W, plug into USB, run `pio run -t upload`.
 
 After the first flash, subsequent uploads happen without BOOTSEL via `picotool` (platformio handles it).
 
-## MQTT topics
+## HTTP API
 
-Topic prefix (`TOPIC_BASE` in `config.h`) defaults to `cozyhem/climate/<device_id>`.
+The firmware advertises itself on mDNS as `barn-minisplit.local` (configurable via `MDNS_HOSTNAME` in `config.h`) on port 80.
 
-| Topic                              | Direction | Format                                           |
-|------------------------------------|-----------|--------------------------------------------------|
-| `cozyhem/climate/<id>/state`       | pub       | JSON: `{power, mode, temperature, fan, vane, widevane, room_temp, operating}` |
-| `cozyhem/climate/<id>/cmd`         | sub       | JSON subset of the state fields (send only what you want to change) |
-| `cozyhem/climate/<id>/available`   | pub       | `online` / `offline` (last-will)                 |
-| `homeassistant/climate/<id>/config`| pub (boot)| Home Assistant MQTT discovery payload            |
+| Method | Path       | Description                                                     |
+|--------|------------|-----------------------------------------------------------------|
+| GET    | `/status`  | Current state as JSON: `{power, mode, temperature, fan, vane, widevane, room_temp, operating, connected}` |
+| POST   | `/command` | Apply a subset of state fields. Echoes the new state back.      |
+| GET    | `/info`    | Device identity: `{device_id, friendly, manufacturer, model, mdns, ip, connected}` |
 
-### Example commands
+### Example
 
-Set the mode to heat and the setpoint to 20°C:
+Fetch state:
 
-    { "mode": "HEAT", "temperature": 20 }
+    curl http://barn-minisplit.local/status
+
+Turn on heat at 20°C:
+
+    curl -X POST -H 'Content-Type: application/json' \
+         -d '{"power":"ON","mode":"HEAT","temperature":20}' \
+         http://barn-minisplit.local/command
 
 Turn the unit off:
 
-    { "power": "OFF" }
+    curl -X POST -H 'Content-Type: application/json' \
+         -d '{"power":"OFF"}' \
+         http://barn-minisplit.local/command
 
 Set the fan to QUIET and the vane to SWING:
 
-    { "fan": "QUIET", "vane": "SWING" }
+    curl -X POST -H 'Content-Type: application/json' \
+         -d '{"fan":"QUIET","vane":"SWING"}' \
+         http://barn-minisplit.local/command
 
-## Home Assistant / CozyHem auto-discovery
+Field domains (all strings except `temperature` which is a float):
 
-On MQTT connect the firmware publishes a retained HA MQTT discovery payload to
-`homeassistant/climate/<device_id>/config`. CozyHem (configured with the
-standard HA discovery prefix) picks the entity up automatically — no manual
-YAML.
+- `power`: `"ON"` | `"OFF"`
+- `mode`: `"HEAT"` | `"COOL"` | `"FAN"` | `"DRY"` | `"AUTO"`
+- `temperature`: 16..31 (°C)
+- `fan`: `"AUTO"` | `"QUIET"` | `"1"` .. `"4"`
+- `vane`: `"AUTO"` | `"1"` .. `"5"` | `"SWING"`
+- `widevane`: `"<<"` | `"<"` | `"|"` | `">"` | `">>"` | `"<>"` | `"SWING"`
+
+## CozyHem integration
+
+The device presents as a REST endpoint that matches the shape of CozyHem's existing adapters (Hue, Anthem). Add a Mitsubishi adapter in `cozyhem-engine/backend/` that polls `GET /status` on an interval and routes CozyHem commands to `POST /command`. mDNS resolution means no static IP reservation is required, though a DHCP reservation is nicer for monitoring.
 
 ## Serial debug
 
-USB CDC runs at 115200 baud. Boot messages, WiFi link state, MQTT connect
-events, and command parse errors print here. Attach `pio device monitor` to
-watch.
+USB CDC runs at 115200 baud. Boot messages, WiFi link state, and command parse errors print here. Attach `pio device monitor` to watch.
 
 ## MCP server
 
-A Python MCP server that wraps the MQTT interface lives at [`server/`](server/).
-It exposes tools like `get_status`, `set_power`, `set_mode`, `set_temperature`,
-and `set_fan_speed` for any MCP client (Alice, Claude Desktop, custom
-integrations). The server does not talk to the Pico directly — it rides the
-same MQTT topics the firmware publishes, so you can keep the firmware
-dedicated to the serial/MQTT loop and layer agent integration on top. See
-[`server/README.md`](server/README.md) for install, config, and the full tool
-reference.
+A Python MCP server that wraps the HTTP interface lives at [`server/`](server/). It exposes tools like `get_status`, `set_power`, `set_mode`, `set_temperature`, and `set_fan_speed` for any MCP client (Alice, Claude Desktop, custom integrations). The server talks REST to the Pico — it does not need a broker. See [`server/README.md`](server/README.md) for install, config, and the full tool reference.
 
 ## Credits
 
 - [SwiCago/HeatPump](https://github.com/SwiCago/HeatPump) — Arduino library implementing the Mitsubishi CN105 protocol.
-- [mlesniew/PicoMQTT](https://github.com/mlesniew/PicoMQTT) — Lightweight MQTT client with RP2040 support.
-- [earlephilhower/arduino-pico](https://github.com/earlephilhower/arduino-pico) — Pico Arduino core.
+- [earlephilhower/arduino-pico](https://github.com/earlephilhower/arduino-pico) — Pico Arduino core with WebServer and LEAmDNS.
 
 ## License
 
