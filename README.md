@@ -292,10 +292,54 @@ application" can leave USB half-initialised; a physical power cycle brings the C
 
 ## Known issues
 
-- `platformio.ini` points `platform` at an unpinned git URL
-  (`https://github.com/maxgerhardt/platform-raspberrypi.git`), so builds are not
-  reproducible over time. This firmware was built against core `6.1.0-4-gfd65f6d4`.
-  Pin it to a release tag before relying on it.
+Known and deliberately not fixed — both were judged not worth the change they
+would require, but neither is documented by the upstream library:
+
+- **A command can revert changes made on the handheld remote.** `wantedSettings`
+  is never resynced from the unit, so `POST /command` rebuilds the control packet
+  from whatever HTTP last sent. Change the setpoint on the remote, then post an
+  unrelated field such as `{"fan":"AUTO"}`, and power/mode/temperature revert.
+  Harmless if HTTP is the only controller; fixing it needs
+  `enableExternalUpdate()` plus `autoUpdate`, which restructures `loop()`'s
+  update model.
+- **A command in the first second or two after boot can be remapped to 31 °C.**
+  The library's `tempMode` starts `false` and is only set when the first settings
+  packet is parsed. Until then `setTemperature()` misses the 16–31 `TEMP_MAP` and
+  falls back to `TEMP_MAP[0]` = 31. The window is between the CONNECT ack and the
+  first settings packet, and the next command corrects it. A guard would be to
+  reject commands until `getPowerSetting()` is non-null.
+
+See "Build reproducibility" below for what the dependency pins do and do not
+guarantee.
+
+## Build reproducibility
+
+All three external dependencies are pinned to exact versions, so a fresh clone
+rebuilds this firmware rather than whatever is newest that day:
+
+| Dependency | Pin | Resolves to |
+|---|---|---|
+| `platform` | `platform-raspberrypi.git#5d4561a` | maxgerhardt fork, `develop` as of 2026-09-10 |
+| arduino-pico core | pinned *by* that platform commit | `fd65f6d4`, `ARDUINO_PICO_VERSION_STR 6.1.0` (pkg `1.60100.0`) |
+| `swicago/HeatPump` | `@1.0.0` | registry 1.0.0 |
+| `bblanchon/ArduinoJson` | `@7.4.3` | 7.4.3 |
+
+Two notes on why the exact pins matter rather than ranges:
+
+- The core version is chosen *inside* the platform's `platform.json`, not by this
+  repo. Pinning `platform` to a commit is therefore what pins the core; a bare
+  git URL tracks the fork's `develop` HEAD, and a fresh install can resolve a
+  different core while this machine's cached copy keeps working.
+- `handleCommand()` is built on behaviours established by reading library source
+  rather than by documented contract: `HeatPump::sync()` performing exactly one
+  action per call, `createInfoPacket`'s rotation through six `INFOMODE` request
+  types (hence the explicit `RQST_PKT_SETTINGS`), and ArduinoJson promoting mixed
+  int/float variant comparisons to `double` so `11` compares equal to `11.0f`.
+  A minor-version bump could change any of these silently.
+
+Verified 2026-10-23: with the pins in place, the platform re-resolved to the same
+commit `5d4561a` and the same core 6.1.0, libraries unchanged at 1.0.0 / 7.4.3,
+and the build succeeded (flash 387172 bytes, RAM 72960 bytes).
 
 ## Credits
 
