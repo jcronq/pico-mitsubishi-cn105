@@ -11,15 +11,20 @@
 //   mDNS advertises "barn-minisplit.local" so clients don't need a static IP.
 //
 // Wiring (Pico W -> CN105 via BSS138 or similar bidirectional level shifter):
-//   Pico GP5  (PIO TX) --[level shifter]-- CN105 pin 5 (unit's RX input, 5V)
-//   Pico GP4  (PIO RX) --[level shifter]-- CN105 pin 4 (unit's TX output, 5V)
-//   Pico GND                               CN105 pin 2 (GND)
-//   Pico VSYS                              CN105 pin 3 (+5V)
-//   CN105 pin 1 (+12V) left disconnected.
+//   CN105 pin 1 (+12V)          : leave disconnected
+//   CN105 pin 2 (GND)           : Pico GND + shifter GND (common ground)
+//   CN105 pin 3 (+5V)           : Pico VSYS + shifter HV rail
+//   CN105 pin 4 (unit TX, 5V)   : --[level shifter]-- Pico GP4 (PIO RX)
+//   CN105 pin 5 (unit RX, 5V)   : --[level shifter]-- Pico GP5 (PIO TX)
 //
-//   Verified empirically 2026-10-22: TX=GP5 / RX=GP4 at 2400 8E1 returns a
-//   checksum-valid CONNECT_ACK (fc 7a 01 30 01 00 54). The reverse orientation,
-//   and 8N1 in either orientation, return zero bytes.
+//   The data pins run STRAIGHT THROUGH (pin 4 -> GP4, pin 5 -> GP5), so the
+//   Pico's roles are TX=GP5 / RX=GP4. Verified empirically 2026-10-22: that
+//   orientation at 2400 8E1 returns a checksum-valid CONNECT_ACK
+//   (fc 7a 01 30 01 00 54); the reverse, and 8N1 either way, return zero bytes.
+//
+//   If you instead cross the data pins (pin 4 -> GP5, pin 5 -> GP4), the roles
+//   become TX=GP4 / RX=GP5 and the hardware UART1 can be used instead of PIO.
+//   Either build works, but the firmware must match the wiring.
 //
 //   WARNING: do not power VSYS from USB while the JST is connected -- CN105
 //   pin 3 and VSYS are both 5V sources with no isolation between them.

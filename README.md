@@ -14,7 +14,7 @@ vane, room-temp readback) over a local HTTP API. No cloud.
 
 ### Wiring
 
-CN105 pin numbering with the connector latch down, pins facing you, left to right:
+CN105 pin numbering, with the connector latch down and the pins facing you, left to right:
 
 | CN105 pin | Signal | Pico W pin |
 |-----------|--------|------------|
@@ -24,14 +24,32 @@ CN105 pin numbering with the connector latch down, pins facing you, left to righ
 | 4         | TX from unit (5V TTL) | Pico `GP4` = serial **RX**, through level shifter |
 | 5         | RX to unit (5V TTL) | Pico `GP5` = serial **TX**, through level shifter |
 
+The signal column (pin 2 GND, pin 3 +5V, pin 4 unit TX, pin 5 unit RX) is confirmed
+against five independent sources: the nicegear blog, `echavet/MitsubishiCN105ESPHome`,
+the ESPHome `mitsubishi_cn105` component, casualhacker.net's CN105 connector writeup,
+and the Serin Labs CN105 wiring guide.
+
+The Pico column above wires the data pins **straight through** (pin 4 to GP4, pin 5 to
+GP5), which is the build this firmware is verified against. An earlier revision of this
+table crossed them (pin 4 to GP5, pin 5 to GP4). Both are valid builds, but the firmware
+must match:
+
+| Data wiring | Pico roles | Port |
+|-------------|-----------|------|
+| straight (pin 4 -> GP4, pin 5 -> GP5) | `CN105_TX_PIN 5`, `CN105_RX_PIN 4` | **`SerialPIO`** — GP5 cannot be a hardware TX pin |
+| crossed (pin 4 -> GP5, pin 5 -> GP4) | `CN105_TX_PIN 4`, `CN105_RX_PIN 5` | hardware `Serial2` (UART1) works |
+
+If you are building fresh and want the simpler firmware path, cross the data pins and use
+the hardware UART. If you already have it wired straight through, leave it alone — the PIO
+path is verified and costs two PIO state machines, nothing else.
+
 The level shifter is mandatory — CN105 is 5V TTL and Pico GPIO is 3.3V-tolerant only.
 
-Note the pin roles: **TX is GP5 and RX is GP4.** This matters more than it looks,
-because it is why the firmware uses `SerialPIO` (PIO software serial) instead of the
-hardware UART. RP2040 UART1 permits TX only on GPIO `{4, 8, 20, 24}`, so GP5 can
-never be a hardware TX pin. PIO has no such restriction. Setting `CN105_TX_PIN 5`
-with a hardware `Serial2` would call `panic()` at boot and halt the chip silently —
-no serial output, no WiFi, nothing on the network.
+One trap is worth stating explicitly, because it fails silently: `CN105_TX_PIN 5` with a
+hardware `Serial2` calls `panic()` at boot and halts the chip in a breakpoint loop. There
+is no serial output, no WiFi, and nothing on the network — it looks like dead hardware
+rather than a crash, because panic output goes to SDK stdio on the UART0 physical pins,
+not USB CDC. TX on GP5 requires `SerialPIO`.
 
 Verified on a MSZ-FH15NA, 2026-10-22: with TX=GP5 / RX=GP4 at 2400 8E1, sending the
 CONNECT packet `fc 5a 01 30 02 ca 01 a8` returns a checksum-valid `CONNECT_ACK`:
@@ -58,9 +76,6 @@ flashing.
 
 Bus framing is 2400 baud, 8 data bits, EVEN parity, 1 stop bit (some indoor units use
 9600; SwiCago's library retries at the other rate automatically).
-
-Pinout confirmed against the ESPHome `mitsubishi_cn105` component, casualhacker.net's
-CN105 connector writeup, and the Serin Labs CN105 wiring guide.
 
 ## Build
 
