@@ -106,6 +106,14 @@ button, not just the first.
 
 The firmware advertises itself on mDNS as `barn-minisplit.local` (configurable via `MDNS_HOSTNAME` in `config.h`) on port 80.
 
+**mDNS resolution costs about 5 seconds per request on macOS.** Measured against this
+firmware: resolving `barn-minisplit.local` takes 5.00 s (`curl`'s `time_namelookup`) while
+the same request to the raw IP completes in 13 ms end to end. The device is not slow — it
+is a fixed resolver timeout, most likely macOS waiting out an AAAA query that LEAmDNS never
+answers before proceeding with the A record. Anything polling on an interval (the CozyHem
+adapter, the MCP server) should address the device by IP with a DHCP reservation rather
+than paying 5 s per poll. `.local` remains convenient for ad-hoc `curl`.
+
 | Method | Path       | Description                                                     |
 |--------|------------|-----------------------------------------------------------------|
 | GET    | `/status`  | Current state as JSON: `{power, mode, temperature, fan, vane, widevane, room_temp, operating, connected}` |
@@ -141,16 +149,43 @@ Set the fan to QUIET and the vane to SWING:
          -d '{"fan":"QUIET","vane":"SWING"}' \
          http://barn-minisplit.local/command
 
-`POST /command` takes roughly 6-8 seconds to return. `HeatPump::update()` gates sending
-on a 2 s interval and then waits up to 1 s to read the acknowledgement, and the handler
-then calls `hp.sync()` so the echoed state reflects the command rather than the state
-before it. The setpoint itself lands on the unit about a second after the write.
+Measured latencies, addressed by IP (see the mDNS note below):
+
+| request | measured |
+|---------|----------|
+| `GET /status`, `GET /info` | ~13 ms |
+| `POST /command`, echo confirmed | ~3.3 s |
+| `POST /command` rejected with 400 | ~16 ms |
+
+`POST /command` is slow because of the bus, not the code, and the echoed state is
+best-effort. `HeatPump::update()` gates sending on a 2 s interval and then waits up to 1 s
+for the acknowledgement. After that the handler has to pump `hp.sync()` until the unit
+confirms the new settings, because `sync()` is a single-step state machine — one call does
+exactly one of connect / read / send-request, so a single call cannot complete a
+request-response round trip, and `update()` refreshes the cached settings only when
+`autoUpdate` is enabled, which it is not.
+
+The pump is bounded by `CMD_CONFIRM_MS` (5 s). That is not a hard bound on latency: the
+check runs once per iteration and `hp.sync()` can itself enter a ~6 s `hp.connect()` if the
+link has gone stale, so the worst case is nearer 10 s. On timeout the echo lags by one sync
+and `GET /status` catches up within about a second. A client that must be certain should
+re-read `/status` rather than trust the echo.
+
+`/command` validates before applying, and rejects the whole request with 400 rather than
+applying part of it. This is not pedantry: SwiCago's string setters fall back to `MAP[0]`
+on an unrecognised value instead of failing, so a lowercase `{"power":"on"}` would set
+power to `"OFF"` — turning the unit off — and return 200 as though it had worked. Unknown
+field names, wrong JSON types, out-of-range temperatures and out-of-domain strings all now
+return 400. A command sent while the CN105 link is down returns 503 instead of silently
+queuing into `wantedSettings`.
 
 Field domains (all strings except `temperature` which is a float):
 
 - `power`: `"ON"` | `"OFF"`
 - `mode`: `"HEAT"` | `"COOL"` | `"FAN"` | `"DRY"` | `"AUTO"`
-- `temperature`: 16..31 (°C)
+- `temperature`: 10..31 (°C). The documented range is 16..31, but FH-series units run
+  SwiCago's `tempMode` and accept down to 10 °C (useful as freeze protection); the unit
+  this was tested against reports a 10 °C setpoint.
 - `fan`: `"AUTO"` | `"QUIET"` | `"1"` .. `"4"`
 - `vane`: `"AUTO"` | `"1"` .. `"5"` | `"SWING"`
 - `widevane`: `"<<"` | `"<"` | `"|"` | `">"` | `">>"` | `"<>"` | `"SWING"`
