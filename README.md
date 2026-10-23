@@ -96,12 +96,11 @@ The firmware advertises itself on mDNS as `barn-minisplit.local` (configurable v
 | GET    | `/status`  | Current state as JSON: `{power, mode, temperature, fan, vane, widevane, room_temp, operating, connected}` |
 | POST   | `/command` | Apply a subset of state fields. Echoes the new state back.      |
 | GET    | `/info`    | Device identity: `{device_id, friendly, manufacturer, model, mdns, ip, connected}` |
-| GET    | `/diag`    | One-shot CN105 link diagnostics — see [Troubleshooting](#troubleshooting) |
-| POST   | `/rpc`     | JSON-RPC-style probes for interactive debugging |
 
-`/diag` and `/rpc` are diagnostic endpoints with no authentication: anyone on the LAN can
-drive the CN105 serial port and toggle GP4/GP5 through them. They are safe on a trusted
-network and worth removing if the device is ever exposed more widely.
+The firmware deliberately exposes nothing else. A `/diag` endpoint and a `/rpc` probe
+interface were used to diagnose the CN105 link (see [Troubleshooting](#troubleshooting))
+and then removed, because they drove the serial port and toggled GPIO with no
+authentication — fine on a trusted LAN, not something to leave running.
 
 ### Example
 
@@ -152,8 +151,9 @@ here. Attach `pio device monitor --baud 115200` to watch.
 
 Two caveats. The boot banner is printed within a second or two of reset, so a monitor
 attached after the fact will have missed it — and since the JST must be off for USB to be
-connected, serial debugging cannot observe a live CN105 link. Use `/diag` and `/rpc` over
-WiFi for that instead. Expected boot sequence:
+connected, **serial debugging cannot observe a live CN105 link at all**. Anything about the
+link itself has to be diagnosed over WiFi (see [Diagnostic tooling](#diagnostic-tooling)).
+Expected boot sequence:
 
     pico-mitsubishi-cn105 boot (HTTP mode)
     WiFi connecting....
@@ -173,60 +173,63 @@ A Python MCP server that wraps the HTTP interface lives at [`server/`](server/).
 answers HTTP at all, WiFi is fine; these are two independent connections, and only the
 serial one is in question.
 
-Run `GET /diag`. It is designed to be conclusive in a single call:
+Check in this order.
 
-| Field | Meaning |
-|-------|---------|
-| `probes[]` | CONNECT sent over {2400, 9600} x {8E1, 8N1}; `rx_bytes` is the thing to read |
-| `passive_listen` | 3 s of pure listening — the unit is a slave and will normally be silent |
-| `swap_test[]` | Same CONNECT with the TX/RX pin roles reversed, over PIO. Entry 0 is the configured orientation; entries 1-2 are reversed and should stay at `rx_bytes=0` |
-| `tx_rx_short` | `true` means TX and RX are tied together — crossed shifter channels or a solder bridge |
-| `rx_line` / `tx_line` | **Largely uninformative on a BSS138 breakout** (see below) |
+**1. Pin roles.** This is the most likely cause on a fresh build, and the symptom is
+exactly `connected: false` forever with no other sign of trouble. The link needs
+**TX=GP5, RX=GP4**. Reversing them produces zero received bytes, silently. Remember that
+TX on GP5 requires `SerialPIO`; a hardware `Serial2` will `panic()` at boot instead.
 
-Read it as follows:
+**2. Framing.** CN105 is 2400 baud 8**E**1. With EVEN parity the unit replies; with 8N1 it
+returns nothing at all, in either pin orientation. Some indoor units run at 9600, and
+`HeatPump::connect()` flips between 2400 and 9600 on retry by itself.
 
-- **A `swap_test` entry answers but entry 0 does not** → the pin roles are backwards.
-  Fix `CN105_TX_PIN` / `CN105_RX_PIN` in `config.h` rather than rewiring. Remember the
-  UART1 constraint above: if TX lands on GP5 the port must be `SerialPIO`.
-- **Bytes arrive but `starts_with_fc` is false, or `header_ok` is false** → framing. Compare
-  the 8E1 and 8N1 rows; CN105 needs EVEN parity.
-- **`echo_of_sent` is true** → TX is looping back into RX; the shifter channels are bridged.
-- **Zero bytes everywhere, in both orientations** → electrical. Check that the level
-  shifter's HV side is actually powered from CN105 pin 3, and check continuity on pins 4/5.
-  This is the one case `/diag` cannot narrow further from software.
+**3. Electrical.** If neither orientation nor either baud produces a single byte, the
+problem is physical: confirm the level shifter's HV side is actually powered from CN105
+pin 3, and check continuity on pins 4 and 5.
 
-A valid reply looks like `fc 7a 01 30 01 00 54` with `type: "CONNECT_ACK"` and
-`header_ok: true`. The checksum is `(0xfc - sum(all preceding bytes, including the leading
-0xfc)) & 0xff`, which is worth computing by hand once to confirm a reply is real and not noise.
+A valid reply to the CONNECT packet `fc 5a 01 30 02 ca 01 a8` looks like:
 
-### Why `rx_line` is not a useful test
+    fc 7a 01 30 01 00 54
 
-The `rx_line` / `tx_line` probes read the pin with the internal pulldown and pullup
-asserted, intending to report `floating` for a disconnected line. On a BSS138 breakout they
-always report `driven_high`, **even with the JST unplugged**: the board has 10k pull-ups to
-each rail, and the RP2040's internal pulldown is only ~50-80k, so the pull-up always wins.
-Ignore the verdict field and read `rx_bytes` instead.
+`0xfc` start, `0x7a` = CONNECT_ACK, then `01 30` header. The checksum is
+`(0xfc - sum(all preceding bytes, including the leading 0xfc)) & 0xff`, which comes to
+`0x54` here — worth computing by hand once to confirm a reply is real and not line noise.
 
-### Interactive probing with `/rpc`
+### Diagnostic tooling
 
-    curl -s -X POST -H 'Content-Type: application/json' \
-         -d '{"method":"pio.probe","params":{"tx":5,"rx":4,"baud":2400,"frame":"8E1"}}' \
-         http://barn-minisplit.local/rpc
+The `/diag` and `/rpc` endpoints used to find the above are preserved in commit
+`72f1f02` and were removed in the commit that follows it. Restore that file temporarily if
+a link ever needs diagnosing again. `/diag` returned, in one call: CONNECT probes across
+{2400, 9600} x {8E1, 8N1}; a passive listen; the same CONNECT with the TX/RX roles reversed
+over PIO software serial; and a TX/RX short test. `/rpc` exposed `sys.info`, `line.probe`,
+`line.short_test`, `uart.probe`, `uart.listen`, `pio.probe`, `hp.connect`, `hp.sync` and
+`hp.status` for interactive probing.
 
-The `Content-Type: application/json` header is **required** — without it WebServer parses
-the body as form data and the request fails with `missing body`.
+Two lessons from that exercise are worth keeping:
 
-Methods: `sys.info`, `line.probe`, `line.short_test`, `uart.probe`, `uart.listen`,
-`pio.probe`, `hp.connect`, `hp.sync`, `hp.status`. An unknown method returns the list.
-`pio.probe` takes `tx`/`rx`/`baud`/`frame`/`send_hex`/`listen_ms`/`invert`; `send_hex`
-accepts `"connect"` for the standard packet, a hex string in either `"deadbeef"` or
-`"de ad be ef"` form, or `""` to listen without transmitting.
+- **Reading the line state with internal pulls proves nothing on a BSS138 breakout.** The
+  board has 10k pull-ups to each rail and the RP2040's internal pulldown is only ~50-80k,
+  so the pin reads high even with the JST physically unplugged. Count received bytes
+  instead.
+- **Always take a control reading with the unit disconnected.** The reversed-orientation
+  probe only became meaningful once the disconnected baseline showed what "nothing
+  attached" looks like.
 
-Note that `hp.connect` and `hp.sync` block for about 6 seconds when the link is down —
-`connect()` contains two `delay(2000)` calls plus two ~1 s waits. This is why `loop()`
-rate-limits reconnection to one attempt every 30 s: calling `hp.sync()` every second
-against a dead link starves `server.handleClient()` and drops roughly three quarters of
-all HTTP requests.
+### HTTP requests time out or are dropped
+
+If most requests get no response while some succeed, the main loop is being starved by the
+CN105 link rather than by anything in the network stack.
+
+`hp.sync()` is **not** non-blocking, despite how it is usually described. Whenever the link
+is down it calls `connect()`, and `connect()` costs about 6 seconds — two `delay(2000)`
+calls plus two roughly 1-second waits. Calling it once per second against a dead link
+leaves almost no time for `server.handleClient()`. Measured on a build that did exactly
+that: 44 of 180 requests answered over 15 minutes, about 24%.
+
+`loop()` therefore syncs only while `hp.isConnected()` and rate-limits reconnection to one
+attempt every `CN105_RETRY_MS` (30 s). With that in place the same poll answers 12 of 12.
+Keep this in mind before moving `hp.sync()` or shortening the retry interval.
 
 ### Nothing enumerates over USB at all
 
