@@ -8,6 +8,10 @@
 //   The Pico serves a small HTTP server:
 //     GET  /status  -> JSON state (power, mode, setpoint, fan, vane, room temp, operating)
 //     POST /command -> JSON subset of state fields to apply
+//     GET  /info    -> identity plus diagnostics (uptime, reset reason, RSSI, ...)
+//     GET  /events  -> in-RAM ring buffer of recent commands, unit-side settings
+//                      changes and CN105 link transitions (lost on reboot)
+//   The RP2040 hardware watchdog reboots the board if loop() wedges.
 //   mDNS advertises "barn-minisplit.local" so clients don't need a static IP.
 //
 // Wiring (Pico W -> CN105 via BSS138 or similar bidirectional level shifter):
@@ -35,6 +39,7 @@
 #include <LEAmDNS.h>
 #include <HeatPump.h>
 #include <ArduinoJson.h>
+#include <hardware/watchdog.h>
 
 #include "secrets.h"
 #include "config.h"
@@ -49,6 +54,192 @@ WebServer server(HTTP_PORT);
 unsigned long lastWifiCheck = 0;
 unsigned long lastSync = 0;
 unsigned long lastConnectAttempt = 0;
+
+// ---------- watchdog ----------
+//
+// The RP2040 watchdog maxes out at ~8.38 s (the SDK doubles the count to work
+// around erratum RP2040-E1), and several paths here block for longer than that
+// in total, so the timeout alone cannot cover them. Instead the dog is fed at
+// every point that starts a bounded wait:
+//   - top of loop()
+//   - each iteration of the WiFi connect wait (WiFi.begin() itself would block
+//     for up to 2 x 15 s, so connectWifi() uses beginNoBlock() and waits itself)
+//   - the start of every CN105 connect attempt, via HeatPump's onConnect
+//     callback. That covers hp.connect() calls made from inside hp.sync() as
+//     well as ours; each attempt is one delay(2000) plus a ~1 s read wait.
+//   - before hp.update() and on every pass of /command's confirm loop
+// The longest unfed stretch is then about 5 s (WebServer's HTTP_MAX_POST_WAIT
+// for a slow client body, or its HTTP_MAX_SEND_WAIT on the reply), which is
+// comfortably inside WDT_TIMEOUT_MS.
+#define WDT_TIMEOUT_MS 8000
+
+static inline void feedWatchdog() { rp2040.wdt_reset(); }
+
+// ---------- diagnostics ----------
+
+// millis() wraps after ~49.7 days; keep a 64-bit uptime so event timestamps
+// stay monotonic across the wrap. Must be called more often than every 49 days,
+// which loop() does.
+static uint64_t uptimeMs() {
+  static uint32_t last = 0, wraps = 0;
+  uint32_t now = millis();
+  if (now < last) wraps++;
+  last = now;
+  return ((uint64_t)wraps << 32) | now;
+}
+
+// Boot counter kept in watchdog scratch registers 0/1. Scratch survives
+// watchdog and soft resets but not a power cycle, so this counts boots since
+// the last power-on. The SDK reserves scratch[4..7] for its own reboot magic.
+#define BOOT_MAGIC 0xC105B007u
+static uint32_t bootCount = 0;
+static const char *resetReason = "unknown";
+
+static void captureBootInfo() {
+  // Read the reason before wdt_begin(): watchdog_enable() rewrites scratch[4],
+  // which getResetReason() consults.
+  switch (rp2040.getResetReason()) {
+    case RP2040::PWRON_RESET:    resetReason = "power_on"; break;
+    case RP2040::RUN_PIN_RESET:  resetReason = "run_pin"; break;
+    case RP2040::SOFT_RESET:     resetReason = "soft"; break;
+    case RP2040::WDT_RESET:      resetReason = "watchdog"; break;
+    case RP2040::DEBUG_RESET:    resetReason = "debug"; break;
+    case RP2040::GLITCH_RESET:   resetReason = "glitch"; break;
+    case RP2040::BROWNOUT_RESET: resetReason = "brownout"; break;
+    default:                     resetReason = "unknown"; break;
+  }
+  if (watchdog_hw->scratch[0] != BOOT_MAGIC) {
+    watchdog_hw->scratch[0] = BOOT_MAGIC;
+    watchdog_hw->scratch[1] = 0;
+  }
+  bootCount = ++watchdog_hw->scratch[1];
+}
+
+static uint32_t cn105ConnectAttempts = 0;  // every hp.connect(), incl. ones from inside hp.sync()
+static uint32_t cn105LinkUps = 0;          // down->up transitions of hp.isConnected()
+static bool lastLinkUp = false;
+
+// /command is refused until the unit has sent at least one SETTINGS packet.
+// Until then HeatPump's tempMode is false and currentSettings is unpopulated,
+// so setTemperature(10) misses TEMP_MAP (16..31) and falls back to TEMP_MAP[0]
+// = 31 degC, and refreshing wantedSettings from currentSettings would copy
+// null pointers.
+static bool gotSettings = false;
+
+// Commands are attributed to settings changes observed while one is in flight.
+static bool inCommand = false;
+static uint64_t lastCommandMs = 0;
+static bool haveLastCommand = false;
+
+struct LastCommand {
+  uint64_t ts;
+  char ip[16];
+  int status;
+  char body[160];
+} lastCommand;
+
+// ---------- event ring ----------
+//
+// Small in-RAM log so "who changed the setpoint?" can be answered from the
+// device itself. Lost on reboot; the boot entry plus reset_reason tells you
+// that happened.
+#define EVENT_RING_SIZE 32
+#define EVENT_DETAIL_LEN 192
+
+enum EventKind : uint8_t { EV_BOOT, EV_COMMAND, EV_SETTINGS_CHANGE, EV_LINK_UP, EV_LINK_DOWN };
+static const char *const EVENT_KIND_NAMES[] = {"boot", "command", "settings_change", "link_up", "link_down"};
+
+struct Event {
+  uint64_t ts;
+  EventKind kind;
+  int16_t status;            // HTTP status for commands, else 0
+  char ip[16];               // client IP for commands, else ""
+  char detail[EVENT_DETAIL_LEN];  // compact JSON
+};
+
+static Event events[EVENT_RING_SIZE];
+static uint32_t eventSeq = 0;  // total events ever recorded; ring index = seq % size
+
+static void recordEvent(EventKind kind, const char *detail, const char *ip = "", int status = 0) {
+  Event &e = events[eventSeq % EVENT_RING_SIZE];
+  e.ts = uptimeMs();
+  e.kind = kind;
+  e.status = status;
+  strlcpy(e.ip, ip, sizeof(e.ip));
+  strlcpy(e.detail, detail, sizeof(e.detail));
+  eventSeq++;
+}
+
+// Previous settings, for computing old->new diffs in the change callback.
+static heatpumpSettings prevSettings;
+static bool havePrevSettings = false;
+
+static void onSettingsChanged() {
+  heatpumpSettings s = hp.getSettings();
+  JsonDocument d;
+  if (!havePrevSettings) {
+    d["initial"] = true;
+    d["power"] = s.power; d["mode"] = s.mode; d["temperature"] = s.temperature;
+    d["fan"] = s.fan; d["vane"] = s.vane; d["widevane"] = s.wideVane;
+  } else {
+    // Pointer compares are what the library itself uses: every string field
+    // points into one of its static *_MAP tables.
+    auto diffStr = [&](const char *k, const char *o, const char *n) {
+      if (o != n) { JsonArray a = d[k].to<JsonArray>(); a.add(o); a.add(n); }
+    };
+    diffStr("power", prevSettings.power, s.power);
+    diffStr("mode", prevSettings.mode, s.mode);
+    if (prevSettings.temperature != s.temperature) {
+      JsonArray a = d["temperature"].to<JsonArray>();
+      a.add(prevSettings.temperature); a.add(s.temperature);
+    }
+    diffStr("fan", prevSettings.fan, s.fan);
+    diffStr("vane", prevSettings.vane, s.vane);
+    diffStr("widevane", prevSettings.wideVane, s.wideVane);
+    if (d.size() == 0) d["other"] = true;  // e.g. iSee bit only
+  }
+  // during_command: seen while POST /command was being handled. Otherwise
+  // ms_since_command says how long after the last /command this arrived; a
+  // change with no recent command came from the remote or the unit itself.
+  d["during_command"] = inCommand;
+  if (haveLastCommand) d["ms_since_command"] = (uint64_t)(uptimeMs() - lastCommandMs);
+  char buf[EVENT_DETAIL_LEN];
+  serializeJson(d, buf, sizeof(buf));
+  recordEvent(EV_SETTINGS_CHANGE, buf);
+  Serial.printf("settings change: %s\n", buf);
+  prevSettings = s;
+  havePrevSettings = true;
+}
+
+// Fires on every packet in and out. Used only to learn when the first SETTINGS
+// reply (0x62 / data[0] == 0x02) has arrived; readPacket() calls this before it
+// parses the packet, but nothing reads gotSettings until it has returned.
+static void onPacket(byte *packet, unsigned int length, char *direction) {
+  if (!gotSettings && length > 5 && !strcmp(direction, "packetRecv") &&
+      packet[1] == 0x62 && packet[5] == 0x02) {
+    gotSettings = true;
+  }
+}
+
+static void onCn105Connect() {
+  // Start of every connect attempt: feed the dog before its ~3 s of blocking.
+  feedWatchdog();
+  cn105ConnectAttempts++;
+}
+
+static void trackLink() {
+  bool up = hp.isConnected();
+  if (up == lastLinkUp) return;
+  lastLinkUp = up;
+  char buf[64];
+  snprintf(buf, sizeof(buf), "{\"connect_attempts\":%lu}", (unsigned long)cn105ConnectAttempts);
+  if (up) {
+    cn105LinkUps++;
+    recordEvent(EV_LINK_UP, buf);
+  } else {
+    recordEvent(EV_LINK_DOWN, buf);
+  }
+}
 
 // While the CN105 link is down, hp.sync() calls hp.connect() on every pass and
 // each connect() blocks ~6s (two delay(2000) plus two 1s read waits), which
@@ -89,6 +280,28 @@ void writeStateInto(JsonObject doc) {
   doc["connected"]   = hp.isConnected();
 }
 
+void writeDiagInto(JsonObject doc) {
+  doc["uptime_s"]              = uptimeMs() / 1000;
+  doc["reset_reason"]          = resetReason;
+  doc["boot_count"]            = bootCount;
+  doc["wifi_rssi"]             = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
+  doc["cn105_connect_attempts"] = cn105ConnectAttempts;
+  doc["cn105_link_ups"]        = cn105LinkUps;
+  // Link-ups after the first one are reconnects.
+  doc["cn105_reconnects"]      = cn105LinkUps > 0 ? cn105LinkUps - 1 : 0;
+  doc["settings_received"]     = gotSettings;
+  doc["free_heap"]             = rp2040.getFreeHeap();
+  if (haveLastCommand) {
+    JsonObject lc = doc["last_command"].to<JsonObject>();
+    lc["ts_uptime"] = lastCommand.ts / 1000.0;
+    lc["source_ip"] = lastCommand.ip;
+    lc["status"]    = lastCommand.status;
+    lc["body"]      = lastCommand.body;
+  } else {
+    doc["last_command"] = nullptr;
+  }
+}
+
 // Open the CN105 link. Always go through here, never hp.connect() directly.
 //
 // SerialPIO::begin() is NOT idempotent. Unlike SerialUART::begin(), which opens
@@ -114,6 +327,35 @@ static bool cn105Connect() {
 void handleStatus() {
   JsonDocument doc;
   writeStateInto(doc.to<JsonObject>());
+  // Diagnostics are nested so they never collide with the state fields
+  // clients diff on.
+  writeDiagInto(doc["diag"].to<JsonObject>());
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleEvents() {
+  JsonDocument doc;
+  doc["uptime_s"] = uptimeMs() / 1000;
+  doc["total"]    = eventSeq;  // > size of "events" means older ones were dropped
+  JsonArray arr = doc["events"].to<JsonArray>();
+  uint32_t n = eventSeq < EVENT_RING_SIZE ? eventSeq : EVENT_RING_SIZE;
+  for (uint32_t i = eventSeq - n; i < eventSeq; i++) {  // oldest first
+    const Event &e = events[i % EVENT_RING_SIZE];
+    JsonObject o = arr.add<JsonObject>();
+    o["seq"]       = i;
+    o["ts_uptime"] = e.ts / 1000.0;
+    o["kind"]      = EVENT_KIND_NAMES[e.kind];
+    if (e.kind == EV_COMMAND) {
+      o["source_ip"] = e.ip;
+      o["status"]    = e.status;
+    }
+    // detail is JSON we produced; embed it as an object rather than a string.
+    JsonDocument det;
+    if (!deserializeJson(det, e.detail)) o["detail"] = det;
+    else o["detail"] = e.detail;  // truncated command body: keep it as text
+  }
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -135,7 +377,39 @@ static bool inDomain(const char *v, const char *const (&list)[N]) {
   return false;
 }
 
+// Every /command request, accepted or not, is recorded with its source IP so a
+// setpoint change can be traced to whoever sent it.
+static void recordCommand(int status, const String &note = String()) {
+  String ip = server.client().remoteIP().toString();
+  String body = server.hasArg("plain") ? server.arg("plain") : String();
+  body.replace("\n", " ");
+  body.replace("\r", " ");
+
+  lastCommand.ts = uptimeMs();
+  strlcpy(lastCommand.ip, ip.c_str(), sizeof(lastCommand.ip));
+  lastCommand.status = status;
+  strlcpy(lastCommand.body, body.c_str(), sizeof(lastCommand.body));
+  lastCommandMs = lastCommand.ts;
+  haveLastCommand = true;
+
+  // Detail is the request body, plus the error for rejected requests. Built
+  // with ArduinoJson so an arbitrary body cannot break the JSON.
+  JsonDocument d;
+  JsonDocument parsed;
+  if (body.length() && !deserializeJson(parsed, body)) d["body"] = parsed;
+  else d["body"] = body.substring(0, 120);
+  if (note.length()) d["error"] = note;
+  char buf[EVENT_DETAIL_LEN];
+  size_t len = serializeJson(d, buf, sizeof(buf));
+  if (len >= sizeof(buf) - 1) {  // truncated: fall back to raw text
+    strlcpy(buf, body.c_str(), sizeof(buf));
+  }
+  recordEvent(EV_COMMAND, buf, ip.c_str(), status);
+  Serial.printf("command from %s -> %d: %s\n", ip.c_str(), status, body.c_str());
+}
+
 static void sendError(int code, const String &msg) {
+  recordCommand(code, msg);
   JsonDocument e;
   e["error"] = msg;
   String body;
@@ -144,6 +418,7 @@ static void sendError(int code, const String &msg) {
 }
 
 void handleCommand() {
+  feedWatchdog();
   if (!server.hasArg("plain")) {
     sendError(400, "missing body");
     return;
@@ -206,6 +481,23 @@ void handleCommand() {
     return;
   }
 
+  if (!gotSettings) {
+    server.sendHeader("Retry-After", "5");
+    sendError(503, "waiting for first settings packet from unit");
+    return;
+  }
+
+  inCommand = true;
+
+  // Start from what the unit is actually set to. HeatPump never resyncs
+  // wantedSettings after the first settings packet (firstRun) unless
+  // autoUpdate+externalUpdate are on, and createPacket() sends every field
+  // where wantedSettings differs from currentSettings. So without this, a
+  // setpoint changed on the handheld remote would be reverted by the next
+  // unrelated command such as {"fan":"AUTO"}. After the refresh only the
+  // fields in this request can differ, so only they go on the wire.
+  hp.setSettings(hp.getSettings());
+
   if (req["power"].is<const char *>())       hp.setPowerSetting(req["power"].as<const char *>());
   if (req["mode"].is<const char *>())        hp.setModeSetting(req["mode"].as<const char *>());
   if (req["temperature"].is<float>())        hp.setTemperature(req["temperature"].as<float>());
@@ -219,6 +511,7 @@ void handleCommand() {
   // ack and push confirmation a full round trip past the budget.
   while (cn105.available()) cn105.read();
 
+  feedWatchdog();
   hp.update();
 
   // Echo the state the unit reports, not the state from before the command.
@@ -232,6 +525,7 @@ void handleCommand() {
   JsonDocument out;
   unsigned long t0 = millis();
   for (;;) {
+    feedWatchdog();
     // Ask for SETTINGS specifically. The default packet type makes
     // createInfoPacket() rotate infoMode through six request types (settings,
     // room temp, timers, status, ...), so a plain sync() has roughly a 1-in-6
@@ -246,6 +540,8 @@ void handleCommand() {
     if (confirmed || millis() - t0 > CMD_CONFIRM_MS) break;
     delay(25);
   }
+  inCommand = false;
+  recordCommand(200);
   String body;
   serializeJson(out, body);
   server.send(200, "application/json", body);
@@ -260,6 +556,7 @@ void handleInfo() {
   doc["mdns"]         = String(MDNS_HOSTNAME) + ".local";
   doc["ip"]           = WiFi.localIP().toString();
   doc["connected"]    = hp.isConnected();
+  writeDiagInto(doc.as<JsonObject>());
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -274,10 +571,13 @@ void handleNotFound() {
 void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(MDNS_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // beginNoBlock, not begin(): begin() waits up to 2 x 15 s internally with no
+  // way to feed the watchdog. Same 30 s budget, fed every 250 ms.
+  WiFi.beginNoBlock(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi connecting");
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
+    feedWatchdog();
     delay(250);
     Serial.print('.');
   }
@@ -302,7 +602,21 @@ void startMdns() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  captureBootInfo();
+  rp2040.wdt_begin(WDT_TIMEOUT_MS);
   Serial.println("\npico-mitsubishi-cn105 boot (HTTP mode)");
+  Serial.printf("reset reason: %s, boot %lu since power-on\n",
+                resetReason, (unsigned long)bootCount);
+  {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"reset_reason\":\"%s\",\"boot_count\":%lu}",
+             resetReason, (unsigned long)bootCount);
+    recordEvent(EV_BOOT, buf);
+  }
+
+  hp.setOnConnectCallback(onCn105Connect);
+  hp.setSettingsChangedCallback(onSettingsChanged);
+  hp.setPacketCallback(onPacket);
 
   connectWifi();
   startMdns();
@@ -310,6 +624,7 @@ void setup() {
   server.on("/status",  HTTP_GET,  handleStatus);
   server.on("/command", HTTP_POST, handleCommand);
   server.on("/info",    HTTP_GET,  handleInfo);
+  server.on("/events",  HTTP_GET,  handleEvents);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.printf("HTTP server up on port %d\n", HTTP_PORT);
@@ -318,9 +633,12 @@ void setup() {
   // retries CN105_RETRY_MS later rather than at millis()==CN105_RETRY_MS.
   lastConnectAttempt = millis();
   cn105Connect();
+  trackLink();
 }
 
 void loop() {
+  feedWatchdog();
+  uptimeMs();  // keep the wrap counter current
   server.handleClient();
   MDNS.update();
 
@@ -333,6 +651,7 @@ void loop() {
     lastConnectAttempt = millis();
     cn105Connect();
   }
+  trackLink();
 
   if (millis() - lastWifiCheck > WIFI_RETRY_MS) {
     lastWifiCheck = millis();
