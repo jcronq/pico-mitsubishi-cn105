@@ -116,9 +116,10 @@ than paying 5 s per poll. `.local` remains convenient for ad-hoc `curl`.
 
 | Method | Path       | Description                                                     |
 |--------|------------|-----------------------------------------------------------------|
-| GET    | `/status`  | Current state as JSON: `{power, mode, temperature, fan, vane, widevane, room_temp, operating, connected}` |
+| GET    | `/status`  | Current state as JSON: `{power, mode, temperature, fan, vane, widevane, room_temp, operating, connected, diag}` |
 | POST   | `/command` | Apply a subset of state fields. Echoes the new state back.      |
-| GET    | `/info`    | Device identity: `{device_id, friendly, manufacturer, model, mdns, ip, connected}` |
+| GET    | `/info`    | Device identity: `{device_id, friendly, manufacturer, model, mdns, ip, connected}` plus the `diag` fields at top level |
+| GET    | `/events`  | Ring buffer of the last 32 commands, unit-side settings changes, link transitions and the boot record |
 
 The firmware deliberately exposes nothing else. A `/diag` endpoint and a `/rpc` probe
 interface were used to diagnose the CN105 link (see [Troubleshooting](#troubleshooting))
@@ -177,7 +178,15 @@ on an unrecognised value instead of failing, so a lowercase `{"power":"on"}` wou
 power to `"OFF"` — turning the unit off — and return 200 as though it had worked. Unknown
 field names, wrong JSON types, out-of-range temperatures and out-of-domain strings all now
 return 400. A command sent while the CN105 link is down returns 503 instead of silently
-queuing into `wantedSettings`.
+queuing into `wantedSettings`, and so does a command sent after the link comes up but
+before the unit's first settings packet has arrived (`Retry-After: 5`; see below).
+
+Commands are applied on top of the unit's **current** settings. The handler copies the
+last settings the unit reported into `wantedSettings` before applying the request, and the
+library's control packet only carries fields where `wantedSettings` differs from the
+unit's reported settings, so only the fields in the request go on the wire. A setpoint
+changed on the handheld remote survives a later unrelated command such as
+`{"fan":"AUTO"}`.
 
 Field domains (all strings except `temperature` which is a float):
 
@@ -189,6 +198,53 @@ Field domains (all strings except `temperature` which is a float):
 - `fan`: `"AUTO"` | `"QUIET"` | `"1"` .. `"4"`
 - `vane`: `"AUTO"` | `"1"` .. `"5"` | `"SWING"`
 - `widevane`: `"<<"` | `"<"` | `"|"` | `">"` | `">>"` | `"<>"` | `"SWING"`
+
+### Diagnostics (`diag`)
+
+`/status` carries a nested `diag` object (nested so it can never collide with the state
+fields clients diff on); `/info` carries the same fields at top level.
+
+| field | meaning |
+|-------|---------|
+| `uptime_s` | seconds since boot (64-bit, survives the 49-day `millis()` wrap) |
+| `reset_reason` | why the chip last reset: `power_on`, `run_pin`, `soft`, `watchdog`, `debug`, `glitch`, `brownout`, `unknown` (arduino-pico's best-effort `getResetReason()`) |
+| `boot_count` | boots since the last power-on, kept in watchdog scratch registers (a power cycle resets it to 1) |
+| `wifi_rssi` | dBm, 0 when WiFi is down |
+| `cn105_connect_attempts` | every `hp.connect()`, including the ones `hp.sync()` makes on its own when the link goes stale |
+| `cn105_link_ups`, `cn105_reconnects` | down-to-up transitions of the CN105 link; reconnects = link ups after the first |
+| `settings_received` | whether the first SETTINGS packet has arrived; `/command` returns 503 until it has |
+| `free_heap` | bytes |
+| `last_command` | `{ts_uptime, source_ip, status, body}` of the most recent `POST /command`, accepted or rejected, or `null` |
+
+### Events (`GET /events`)
+
+An in-RAM ring of the last 32 events, oldest first, with `total` counting every event
+since boot (if `total` exceeds the array length, older ones were overwritten). The ring is
+lost on reboot; the `boot` entry and `reset_reason` tell you that happened.
+
+| kind | detail |
+|------|--------|
+| `boot` | `{reset_reason, boot_count}` |
+| `command` | every `POST /command` with `source_ip`, HTTP `status`, and `detail.body` (plus `detail.error` when rejected) |
+| `settings_change` | settings reported by the unit that differ from the previous report, as `{field: [old, new]}`. The first report after boot is `{initial: true, ...}`. `during_command` is true when it arrived while `/command` was being handled; otherwise `ms_since_command` is the time since the last `/command`. A change with no command shortly before it came from the handheld remote or the unit itself. |
+| `link_up` / `link_down` | CN105 link transitions, with the running connect-attempt count |
+
+Example:
+
+    curl http://barn-minisplit.local/events
+
+### Watchdog
+
+The RP2040 hardware watchdog is armed at 8 s (the chip's maximum is ~8.38 s). It is fed at
+the top of `loop()`, on every pass of the WiFi connect wait, at the start of every CN105
+connect attempt (through HeatPump's `onConnect` callback, so connects made from inside
+`hp.sync()` are covered too), and throughout `POST /command`. The longest unfed stretch is
+about 5 s, the WebServer's own body-read and send timeouts. WiFi uses `beginNoBlock()`
+because `WiFi.begin()` blocks for up to 30 s internally. If the main loop wedges, the board
+reboots and `diag.reset_reason` reads `watchdog`.
+
+Note the watchdog is paused while a debugger halts the core, and that a `picotool`
+"reboot to application" after a flash is not a watchdog reset.
 
 ## CozyHem integration
 
@@ -206,6 +262,7 @@ link itself has to be diagnosed over WiFi (see [Diagnostic tooling](#diagnostic-
 Expected boot sequence:
 
     pico-mitsubishi-cn105 boot (HTTP mode)
+    reset reason: power_on, boot 1 since power-on
     WiFi connecting....
     WiFi up: 10.20.30.100
     mDNS: barn-minisplit.local -> 10.20.30.100
@@ -290,24 +347,23 @@ is evidence about the cable, not the boards.
 If a flash succeeds but no `/dev/tty.usbmodem*` appears, picotool's soft "reboot to
 application" can leave USB half-initialised; a physical power cycle brings the CDC port up.
 
-## Known issues
+## Fixed issues
 
-Known and deliberately not fixed — both were judged not worth the change they
-would require, but neither is documented by the upstream library:
+Both of these were previously listed as known issues; neither is documented by the
+upstream library.
 
-- **A command can revert changes made on the handheld remote.** `wantedSettings`
-  is never resynced from the unit, so `POST /command` rebuilds the control packet
-  from whatever HTTP last sent. Change the setpoint on the remote, then post an
-  unrelated field such as `{"fan":"AUTO"}`, and power/mode/temperature revert.
-  Harmless if HTTP is the only controller; fixing it needs
-  `enableExternalUpdate()` plus `autoUpdate`, which restructures `loop()`'s
-  update model.
-- **A command in the first second or two after boot can be remapped to 31 °C.**
+- **A command could revert changes made on the handheld remote.** HeatPump resyncs
+  `wantedSettings` from the unit only on the first settings packet (or continuously
+  with `autoUpdate` + `enableExternalUpdate()`, which this firmware does not use), so
+  `POST /command` used to build the control packet from whatever HTTP last sent.
+  Change the setpoint on the remote, post `{"fan":"AUTO"}`, and power/mode/temperature
+  reverted. Fixed by `hp.setSettings(hp.getSettings())` at the top of the apply step.
+- **A command in the first second or two after boot could be remapped to 31 °C.**
   The library's `tempMode` starts `false` and is only set when the first settings
-  packet is parsed. Until then `setTemperature()` misses the 16–31 `TEMP_MAP` and
-  falls back to `TEMP_MAP[0]` = 31. The window is between the CONNECT ack and the
-  first settings packet, and the next command corrects it. A guard would be to
-  reject commands until `getPowerSetting()` is non-null.
+  packet is parsed. Until then `setTemperature(10)` misses the 16–31 `TEMP_MAP` and
+  falls back to `TEMP_MAP[0]` = 31 (`HeatPump.cpp`, `setTemperature`). `/command` now
+  returns 503 until a SETTINGS reply (`0x62`, data type `0x02`) has been seen, detected
+  through HeatPump's packet callback.
 
 See "Build reproducibility" below for what the dependency pins do and do not
 guarantee.
@@ -340,6 +396,10 @@ Two notes on why the exact pins matter rather than ranges:
 Verified 2026-10-23: with the pins in place, the platform re-resolved to the same
 commit `5d4561a` and the same core 6.1.0, libraries unchanged at 1.0.0 / 7.4.3,
 and the build succeeded (flash 387172 bytes, RAM 72960 bytes).
+
+Rebuilt 2026-10-25 from a clean PlatformIO install (Core 6.2.0) with the watchdog,
+command-guard and event-ring changes: same pins, build succeeded with no warnings in
+`main.cpp` (flash 395916 bytes, RAM 80388 bytes).
 
 ## Credits
 
