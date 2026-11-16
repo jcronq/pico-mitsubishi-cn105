@@ -568,13 +568,14 @@ void handleNotFound() {
 }
 
 // POST /reset reboots the Pico via the hardware watchdog. The 200 ack goes
-// out first, then a short delay gives the TCP response time to flush before
-// watchdog_reboot() takes the board down. The reboot shows up in /info as
-// reset_reason="watchdog" afterwards. Available on the LAN like the rest of
-// the API; no auth, so protect at the network layer if needed.
+// out first; the short delay lets WebServer close the client socket
+// cleanly before watchdog_reboot() takes the board down. The reboot
+// shows up in /info as reset_reason="watchdog" afterwards, which lets
+// clients confirm a requested reset actually fired. Available on the LAN
+// like the rest of the API; no auth, so protect at the network layer if
+// needed.
 void handleReset() {
   server.send(200, "application/json", "{\"status\":\"rebooting\"}");
-  server.handleClient();  // flush the reply before we yank the board
   Serial.println("api reset requested, rebooting via watchdog");
   delay(100);
   watchdog_reboot(0, 0, 0);
