@@ -39,6 +39,7 @@
 #include <LEAmDNS.h>
 #include <HeatPump.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <hardware/watchdog.h>
 
 #include "secrets.h"
@@ -566,6 +567,21 @@ void handleNotFound() {
   server.send(404, "application/json", "{\"error\":\"not found\"}");
 }
 
+// POST /reset reboots the Pico via the hardware watchdog. The 200 ack goes
+// out first; the short delay lets WebServer close the client socket
+// cleanly before watchdog_reboot() takes the board down. The reboot
+// shows up in /info as reset_reason="watchdog" afterwards, which lets
+// clients confirm a requested reset actually fired. Available on the LAN
+// like the rest of the API; no auth, so protect at the network layer if
+// needed.
+void handleReset() {
+  server.send(200, "application/json", "{\"status\":\"rebooting\"}");
+  Serial.println("api reset requested, rebooting via watchdog");
+  delay(100);
+  watchdog_reboot(0, 0, 0);
+  // unreachable
+}
+
 // ---------- lifecycle ----------
 
 void connectWifi() {
@@ -599,6 +615,38 @@ void startMdns() {
   }
 }
 
+// Arduino OTA — after the first physical flash, subsequent firmware updates
+// go over WiFi. espota.py (bundled with arduino-pico) uploads to port 2040
+// with OTA_PASSWORD as the MD5 challenge. Hostname matches MDNS_HOSTNAME so
+// `pio run -t upload --upload-port <host>.local` resolves without a static
+// IP. OTA start/end are watchdog-fed; progress ticks are too, in case a
+// slow LAN link stretches the transfer past WDT_TIMEOUT_MS.
+void startOta() {
+  ArduinoOTA.setHostname(MDNS_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    feedWatchdog();
+    recordEvent(EV_BOOT, "{\"ota\":\"start\"}");
+    Serial.println("ota: start");
+  });
+  ArduinoOTA.onEnd([]() {
+    feedWatchdog();
+    recordEvent(EV_BOOT, "{\"ota\":\"end\"}");
+    Serial.println("\nota: end");
+  });
+  ArduinoOTA.onProgress([](unsigned int cur, unsigned int total) {
+    feedWatchdog();
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"ota_error\":%u}", (unsigned)error);
+    recordEvent(EV_BOOT, buf);
+    Serial.printf("ota: error %u\n", (unsigned)error);
+  });
+  ArduinoOTA.begin();
+  Serial.printf("OTA ready: %s.local\n", MDNS_HOSTNAME);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -625,9 +673,12 @@ void setup() {
   server.on("/command", HTTP_POST, handleCommand);
   server.on("/info",    HTTP_GET,  handleInfo);
   server.on("/events",  HTTP_GET,  handleEvents);
+  server.on("/reset",   HTTP_POST, handleReset);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.printf("HTTP server up on port %d\n", HTTP_PORT);
+
+  startOta();
 
   // Seed the retry clock from this attempt, not from boot, so a failure here
   // retries CN105_RETRY_MS later rather than at millis()==CN105_RETRY_MS.
@@ -641,6 +692,7 @@ void loop() {
   uptimeMs();  // keep the wrap counter current
   server.handleClient();
   MDNS.update();
+  ArduinoOTA.handle();
 
   if (hp.isConnected()) {
     if (millis() - lastSync >= SYNC_INTERVAL_MS) {

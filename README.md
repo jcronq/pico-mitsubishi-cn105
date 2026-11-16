@@ -120,11 +120,40 @@ than paying 5 s per poll. `.local` remains convenient for ad-hoc `curl`.
 | POST   | `/command` | Apply a subset of state fields. Echoes the new state back.      |
 | GET    | `/info`    | Device identity: `{device_id, friendly, manufacturer, model, mdns, ip, connected}` plus the `diag` fields at top level |
 | GET    | `/events`  | Ring buffer of the last 32 commands, unit-side settings changes, link transitions and the boot record |
+| POST   | `/reset`   | Reboot the Pico via the hardware watchdog. The response acks before the reboot fires, so a successful call returns `{"status":"rebooting"}` and the device is unreachable for ~2 s. The new boot's `/info` reports `reset_reason: "watchdog"`. Useful when the CN105 link's handshake has gone stale and you can't physically press the button. |
 
 The firmware deliberately exposes nothing else. A `/diag` endpoint and a `/rpc` probe
 interface were used to diagnose the CN105 link (see [Troubleshooting](#troubleshooting))
 and then removed, because they drove the serial port and toggled GPIO with no
 authentication — fine on a trusted LAN, not something to leave running.
+
+### OTA firmware updates
+
+After the first physical flash, subsequent builds upload over WiFi via
+Arduino OTA. `platformio.ini` includes an `ota` environment that targets
+the Pico by its mDNS name on port 2040; the password is pulled from the
+`OTA_PASSWORD` environment variable so it stays out of the repo and must
+match the same `#define OTA_PASSWORD` in `secrets.h`.
+
+Export the password once per shell, then upload over the air:
+
+    export OTA_PASSWORD='your-ota-password'
+    pio run -e ota -t upload
+
+Override the target per-run to skip the ~5 s macOS mDNS wait (or to pick
+a different device):
+
+    pio run -e ota -t upload --upload-port 10.20.30.100
+
+An over-the-air upload takes about 30 s on LAN. The firmware feeds the
+watchdog on OTA start, progress, and end, so slow links don't trip
+`WDT_TIMEOUT_MS` mid-upload. The OTA handshake is UDP MD5-challenge and
+was designed for LAN only; keep the device on a trusted segment.
+
+If an OTA attempt fails halfway and leaves the device unreachable, a
+physical USB-plus-BOOTSEL flash recovers it — the partition the current
+firmware runs from is left untouched until the upload verifies
+end-to-end.
 
 ### Example
 
